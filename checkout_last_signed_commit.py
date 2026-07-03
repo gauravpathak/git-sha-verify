@@ -289,9 +289,7 @@ def main(argv: list[str] | None = None) -> None:
                         if signed_commit_sha is not None:
                             logger.info("Got Signed Commit SHA: %s", signed_commit_sha)
                             git_repo.repo_instance.git.checkout(signed_commit_sha)
-                            unique_ids.clear()
-                            emails.clear()
-                            break
+                            return
         git_fetch_depth *= 2
 
 
