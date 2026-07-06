@@ -180,10 +180,7 @@ class GitCheckVerifiedCommit:
         """Fetch the remote repo with specified depth. Return True if new commits were fetched, False otherwise."""
         num_jobs = os.cpu_count()
         if self.repo_instance is not None:
-            if depth_val == INITIAL_GIT_FETCH_DEPTH:
-                self.fetch_args = {"depth": depth_val}
-            else:
-                self.fetch_args = {"deepen": min(GIT_FETCH_DEPTH_LIMIT, depth_val)}
+            self.fetch_args = {"depth": depth_val} if depth_val == INITIAL_GIT_FETCH_DEPTH else {"deepen": min(GIT_FETCH_DEPTH_LIMIT, depth_val)}
 
             fetcher_info = self.repo_instance.git.fetch(
                 "origin",
