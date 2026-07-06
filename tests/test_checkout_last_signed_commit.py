@@ -32,7 +32,7 @@ class Tests(unittest.TestCase):
         assert gpg_key_fetcher.fetch_user_uid() == []
 
     def test_checkout_verified_commit_uninitialized(self) -> None:
-        commit_checker = checkout_last_signed_commit.GitCheckVerifiedCommit()
+        commit_checker = checkout_last_signed_commit.GitRepoVerifier()
         assert commit_checker.path_to_checkout_dir is None
         assert commit_checker.repository_url is None
         assert commit_checker.commit_sha is None
@@ -182,7 +182,7 @@ class Tests(unittest.TestCase):
 
     @patch("checkout_last_signed_commit.Path")
     def test_create_checkout_dir(self, mock_path: MagicMock) -> None:
-        commit_checker = checkout_last_signed_commit.GitCheckVerifiedCommit(target_dir="fake_dir")
+        commit_checker = checkout_last_signed_commit.GitRepoVerifier(target_dir="fake_dir")
 
         # Success case
         assert commit_checker.create_checkout_dir() == "fake_dir"
@@ -206,7 +206,7 @@ class Tests(unittest.TestCase):
         mock_repo = MagicMock()
         mock_repo_class.init.return_value = mock_repo
 
-        commit_checker = checkout_last_signed_commit.GitCheckVerifiedCommit(
+        commit_checker = checkout_last_signed_commit.GitRepoVerifier(
             target_dir="fake_dir", repo_url="https://github.com/example/repo.git"
         )
         commit_checker.init_or_load_repo()
@@ -227,24 +227,24 @@ class Tests(unittest.TestCase):
         mock_git_path.is_dir.return_value = True
         mock_path.return_value = mock_git_path
 
-        commit_checker2 = checkout_last_signed_commit.GitCheckVerifiedCommit(
+        commit_checker2 = checkout_last_signed_commit.GitRepoVerifier(
             target_dir="fake_dir", repo_url="https://github.com/example/repo.git"
         )
         commit_checker2.init_or_load_repo()
         mock_repo_class.assert_called_with("fake_dir/.git")
 
     def test_fetch_git_repo(self) -> None:
-        commit_checker = checkout_last_signed_commit.GitCheckVerifiedCommit(target_dir="fake_dir")
+        commit_checker = checkout_last_signed_commit.GitRepoVerifier(target_dir="fake_dir")
 
         # repo_instance is None
-        assert commit_checker.fetch_git_repo() is None
+        assert commit_checker.fetch_git_repo() == ""
 
         # repo_instance is not None
         mock_repo = MagicMock()
         mock_repo.git.fetch.return_value = ("status", "stdout", "stderr_output")
         commit_checker.repo_instance = mock_repo
 
-        res = commit_checker.fetch_git_repo(depth_val=5)
+        res = commit_checker.fetch_git_repo(depth=5)
         assert res == "stderr_output"
         mock_repo.git.fetch.assert_called_once_with(
             "origin",
@@ -257,7 +257,7 @@ class Tests(unittest.TestCase):
         )
 
     def test_get_default_remote_branch(self) -> None:
-        commit_checker = checkout_last_signed_commit.GitCheckVerifiedCommit(target_dir="fake_dir")
+        commit_checker = checkout_last_signed_commit.GitRepoVerifier(target_dir="fake_dir")
 
         # Case when repo_instance is None
         assert commit_checker.get_default_remote_branch() is None
@@ -274,9 +274,9 @@ class Tests(unittest.TestCase):
             assert commit_checker.get_default_remote_branch() == expected_branch
             mock_repo.git.remote.assert_called_once_with("show", "origin")
 
-    @patch.object(checkout_last_signed_commit.GitCheckVerifiedCommit, "get_default_remote_branch")
+    @patch.object(checkout_last_signed_commit.GitRepoVerifier, "get_default_remote_branch")
     def test_get_commiter_email(self, mock_get_def_branch: MagicMock) -> None:
-        commit_checker = checkout_last_signed_commit.GitCheckVerifiedCommit(target_dir="fake_dir")
+        commit_checker = checkout_last_signed_commit.GitRepoVerifier(target_dir="fake_dir")
 
         # Case 1: branch is not None, repo_instance is None
         assert commit_checker.get_commiter_email(git_branch="dev") == []
@@ -299,7 +299,7 @@ class Tests(unittest.TestCase):
         mock_repo.iter_commits.assert_called_once_with("origin/main", committer="suse")
 
     def test_get_signed_commit_sha(self) -> None:
-        commit_checker = checkout_last_signed_commit.GitCheckVerifiedCommit(target_dir="fake_dir")
+        commit_checker = checkout_last_signed_commit.GitRepoVerifier(target_dir="fake_dir")
 
         # Case when repo_instance is None
         assert commit_checker.get_signed_commit_sha("main") is None
@@ -322,7 +322,7 @@ class Tests(unittest.TestCase):
         assert args.target_dir == "fake_dir"
         assert args.url == "https://example.com/repo.git"
 
-    @patch("checkout_last_signed_commit.GitCheckVerifiedCommit")
+    @patch("checkout_last_signed_commit.GitRepoVerifier")
     @patch("checkout_last_signed_commit.GitLabGPGKeyFetcher")
     @patch("checkout_last_signed_commit.gnupg.GPG")
     def test_main_scenarios(
@@ -362,7 +362,7 @@ class Tests(unittest.TestCase):
                 "committer_emails": ["developer@suse.com"],
                 "uids": [123, 456],
                 "gpg_key_side": [None, "good-gpg-key"],
-                "import_code": 1,
+                "import_code": 0,
                 "signed_commit": "abcdef123456",
                 "expected_exit": None,
                 "expected_checkout": "abcdef123456",
@@ -378,6 +378,17 @@ class Tests(unittest.TestCase):
                 "expected_exit": None,
                 "expected_checkout": "abcdef987654",
             },
+            # Case 5: Hit loop break, gpg_keys_not_found cache, and import failures
+            {
+                "fetch_repo_ret": ["", "", "remote: Total 0 "],
+                "committer_emails": [["missing@suse.com"], ["missing@suse.com", "badkey@suse.com"]],
+                "uids": [[101], [202]],
+                "gpg_key_side": [None, "bad-gpg-key"],
+                "import_code": 1,
+                "signed_commit": None,
+                "expected_exit": None,
+                "expected_checkout": None,
+            },
         ]
 
         for s in scenarios:
@@ -386,7 +397,10 @@ class Tests(unittest.TestCase):
             mock_checker_class.reset_mock()
 
             mock_checker = MagicMock()
-            mock_checker.fetch_git_repo.return_value = s["fetch_repo_ret"]
+            if isinstance(s["fetch_repo_ret"], list):
+                mock_checker.fetch_git_repo.side_effect = s["fetch_repo_ret"]
+            else:
+                mock_checker.fetch_git_repo.return_value = s["fetch_repo_ret"]
 
             if s["committer_emails"] and isinstance(s["committer_emails"][0], list):
                 mock_checker.get_commiter_email.side_effect = s["committer_emails"]
@@ -425,7 +439,10 @@ class Tests(unittest.TestCase):
                 assert exc_info.value.code == s["expected_exit"]
             else:
                 checkout_last_signed_commit.main(["-t", "fake_dir", "-u", "https://example.com/repo.git"])
-                mock_checker.repo_instance.git.checkout.assert_called_once_with(s["expected_checkout"])
+                if s["expected_checkout"]:
+                    mock_checker.repo_instance.git.checkout.assert_called_once_with(s["expected_checkout"])
+                else:
+                    mock_checker.repo_instance.git.checkout.assert_not_called()
 
     def test_main_execution(self) -> None:
         import sys
