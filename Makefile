@@ -41,7 +41,7 @@ only-test-with-coverage:
 checkstyle: ruff typecheck check-maintainability check-code-health
 
 .PHONY: test
-test: only-test checkstyle
+test: only-test-with-coverage checkstyle
 
 .PHONY: test-with-coverage
 test-with-coverage: only-test-with-coverage checkstyle

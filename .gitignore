@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+.idea/
+*.egg-info/
+uv.lock
+.coverage
+coverage.xml
