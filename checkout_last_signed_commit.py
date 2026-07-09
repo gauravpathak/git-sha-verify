@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 
 GITLAB_USER_API_DEFAULT = "https://gitlab.suse.de/api/v4/users/"
 INITIAL_GIT_FETCH_DEPTH = 2
+
+# Depth 2147483647 (0x7fffffff, max signed 32-bit int) means infinite depth: https://git-scm.com/docs/shallow
+GIT_FETCH_DEPTH_LIMIT = 2147483647
 FETCH_NO_NEW_COMMITS_REGEX = "remote:.*Total 0 .*"
 
 
@@ -123,7 +126,7 @@ class GitLabGPGKeyFetcher:
         return [entry.get("id") for entry in data or []]
 
 
-class GitCheckVerifiedCommit:
+class GitRepoVerifier:
     # ruff: noqa: E501
     """Checking out verified commit class functionalities to check GPG commit signature before checking out the git commit.
 
@@ -131,12 +134,10 @@ class GitCheckVerifiedCommit:
     ----------
         target_dir (str): Target directory where to clone or checkout the repository.
         repo_url (str): Git Repository URL.
-        fetch_depth (int): Initial Value to provide for fetching number of commits from Git Repository.
 
     """
 
-    def __init__(self, target_dir: str | None = None, repo_url: str | None = None, fetch_depth: int | None = 2) -> None:
-        self.fetch_depth = fetch_depth
+    def __init__(self, target_dir: str | None = None, repo_url: str | None = None) -> None:
         self.path_to_checkout_dir = target_dir
         self.repository_url = repo_url
         self.commit_sha = None
@@ -171,27 +172,30 @@ class GitCheckVerifiedCommit:
             logger.info("Using existing repo at path: %s", path)
             self.repo_instance = git.Repo(path)
 
-    def fetch_git_repo(self, depth_val: int = 2) -> str | None:
-        """Fetch the remote repository with specified depth.
-
-        Returns True if new commits were fetched, False otherwise.
-        """
-        if self.repo_instance is not None:
-            self.fetch_depth = depth_val
-            logger.info("Fetching with depth %s", self.fetch_depth)
+    def fetch_git_repo(self, depth: int = INITIAL_GIT_FETCH_DEPTH) -> str:
+        """Fetch a specific depth of the remote repository and return its stderr output, or an empty string if not initialized."""
+        cpus = os.cpu_count() or 1
+        fetch_jobs = max(1, cpus - 1)
+        if self.repo_instance:
             fetcher_info = self.repo_instance.git.fetch(
-                "origin", depth=self.fetch_depth, with_extended_output=True, progress=True
+                "origin",
+                "--no-tags",
+                "--no-show-forced-updates",
+                with_extended_output=True,
+                progress=True,
+                jobs=fetch_jobs,
+                depth=min(GIT_FETCH_DEPTH_LIMIT, depth),
             )
             logger.debug("Status: %s", fetcher_info[0])
             logger.debug("stdout %s", fetcher_info[1])
             logger.debug("stderr: %s", fetcher_info[2])
             return fetcher_info[2]
-        return None
+        return ""
 
     def get_default_remote_branch(self) -> str | None:
         """Determine the default branch name from the remote 'origin'."""
         default_branch = None
-        if self.repo_instance is not None:
+        if self.repo_instance:
             head_branch = self.repo_instance.git.remote("show", "origin")
             matches = re.search(r"\s*HEAD branch:\s*(.*)", head_branch)
             if matches:
@@ -201,25 +205,20 @@ class GitCheckVerifiedCommit:
 
     def get_commiter_email(self, git_branch: str | None = None) -> list:
         """Get unique committer emails for a given branch ref, filtered by 'suse' committer."""
-        emails = []
-        if git_branch is not None:
-            ref_name = "origin/" + str(git_branch)
-        else:
-            ref_name = "origin/" + str(self.get_default_remote_branch())
-
-        if self.repo_instance is not None:
-            commits = self.repo_instance.iter_commits(ref_name, committer="suse")
-            emails.extend(commit.committer.email for commit in commits)
-        return sorted(set(emails))
+        ref_name = f"origin/{git_branch or self.get_default_remote_branch()}"
+        if self.repo_instance:
+            emails = {commit.committer.email for commit in self.repo_instance.iter_commits(ref_name, committer="suse")}
+            return sorted(emails)
+        return []
 
     def get_signed_commit_sha(self, git_branch: str | None = None) -> str | None:
         """Search the git log for the most recent commit with a Good (G) or Unknown (U) GPG signature."""
         commit_sha = None
-        ref_name = "origin/" + str(git_branch)
-        if self.repo_instance is not None:
+        ref_name = f"origin/{git_branch or self.get_default_remote_branch()}"
+        if self.repo_instance:
             log_op = self.repo_instance.git.log(ref_name, '--pretty="%G? %H"')
             regex_search = re.search(r"(?<=[UG] )[a-fA-F0-9]*", log_op)
-            if regex_search is not None:
+            if regex_search:
                 commit_sha = regex_search.group(0)
         return commit_sha
 
@@ -244,15 +243,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> None:
-    unique_ids = []
-    signed_commit_sha = None
-    default_remote_branch = None
-    gpg_keys_imported = []
+    gpg_keys_imported = set()
+    gpg_keys_not_found = set()
     git_fetch_depth = INITIAL_GIT_FETCH_DEPTH
 
     args = parse_args(argv)
 
-    git_repo = GitCheckVerifiedCommit(args.target_dir, args.url)
+    git_repo = GitRepoVerifier(args.target_dir, args.url)
     git_repo.create_checkout_dir()
     git_repo.init_or_load_repo()
 
@@ -262,35 +259,72 @@ def main(argv: list[str] | None = None) -> None:
     private_token = os.environ.get("PRIVATE_TOKEN")
     gitlab_key_fetcher = GitLabGPGKeyFetcher(private_token=private_token)
     gpg_instance = gnupg.GPG()
-    while True:  # noqa: PLR1702 too-many-nested-blocks
+    while True:
         fetch_output = git_repo.fetch_git_repo(git_fetch_depth)
         regx_search = re.search(FETCH_NO_NEW_COMMITS_REGEX, fetch_output)
-        if regx_search is not None and git_repo.fetch_depth == 2:
+        if regx_search and git_fetch_depth == INITIAL_GIT_FETCH_DEPTH:
             err_msg = "No new commits found on server"
             logger.error(err_msg)
             sys.exit(err_msg)
+        elif regx_search or git_fetch_depth >= GIT_FETCH_DEPTH_LIMIT:
+            logger.error("Cannot find a verified commit in last %s commits", git_fetch_depth)
+            break
 
         emails = git_repo.get_commiter_email(default_remote_branch)
         for e in emails:
-            if e not in gpg_keys_imported:
-                unique_ids = gitlab_key_fetcher.fetch_user_uid(e)
-                logger.debug("User UID: %s", unique_ids)
-                for uid in unique_ids:
-                    gpg_key = gitlab_key_fetcher.get_gpg_key_by_uid(uid)
-                    if gpg_key is not None:
-                        import_result = gpg_instance.import_keys(gpg_key)
-                        regx_search = re.search(r"gpg: no valid OpenPGP data found", import_result.stderr)
-                        if import_result.returncode == 0 and regx_search is None:
-                            gpg_keys_imported.append(e)
-                        else:
-                            logger.error("no valid OpenPGP data found for uid: %s", uid)
+            signed_commit_sha = process_committer_email(
+                e,
+                git_repo,
+                gitlab_key_fetcher,
+                gpg_instance,
+                default_remote_branch,
+                gpg_keys_imported=gpg_keys_imported,
+                gpg_keys_not_found=gpg_keys_not_found,
+            )
+            if signed_commit_sha:
+                logger.info("Got Signed Commit SHA: %s", signed_commit_sha)
+                git_repo.repo_instance.git.checkout(signed_commit_sha)
+                return
 
-                        signed_commit_sha = git_repo.get_signed_commit_sha(default_remote_branch)
-                        if signed_commit_sha is not None:
-                            logger.info("Got Signed Commit SHA: %s", signed_commit_sha)
-                            git_repo.repo_instance.git.checkout(signed_commit_sha)
-                            return
-        git_fetch_depth *= 2
+        git_fetch_depth = min(git_fetch_depth * 2, GIT_FETCH_DEPTH_LIMIT)
+
+
+def process_committer_email(
+    email: str,
+    git_repo: GitRepoVerifier,
+    gitlab_key_fetcher: GitLabGPGKeyFetcher,
+    gpg_instance: gnupg.GPG,
+    default_remote_branch: str | None,
+    *,
+    gpg_keys_imported: set[str],
+    gpg_keys_not_found: set[str],
+) -> str | None:
+    """Process a single committer's email, importing GPG keys and checking for a signed commit."""
+    if email in gpg_keys_imported:
+        logger.debug("GPG Keys already Imported for %s", email)
+        return None
+    if email in gpg_keys_not_found:
+        logger.debug("GPG Keys not found for %s", email)
+        return None
+
+    unique_ids = gitlab_key_fetcher.fetch_user_uid(email)
+    imported_any = False
+    for uid in unique_ids:
+        gpg_key = gitlab_key_fetcher.get_gpg_key_by_uid(uid)
+        if gpg_key:
+            import_result = gpg_instance.import_keys(gpg_key)
+            regx_search = re.search(r"gpg: no valid OpenPGP data found", import_result.stderr)
+            if import_result.returncode == 0 and not regx_search:
+                imported_any = True
+            else:
+                logger.error("no valid OpenPGP data found for uid: %s", uid)
+
+    if imported_any:
+        gpg_keys_imported.add(email)
+        return git_repo.get_signed_commit_sha(default_remote_branch)
+
+    gpg_keys_not_found.add(email)
+    return None
 
 
 if __name__ == "__main__":
